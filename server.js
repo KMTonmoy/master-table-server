@@ -7,6 +7,8 @@ const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const bcrypt = require("bcryptjs");
 const crypto = require("crypto");
 const passport = require("passport");
+const PDFDocument = require("pdfkit");
+const XLSX = require("xlsx");
 
 const { signToken } = require("./utils/jwt");
 const { sendPasswordResetEmail } = require("./utils/mailer");
@@ -83,6 +85,24 @@ if (carts) {
     .catch((e) => console.error("carts index error", e));
 }
 
+if (usersCollection) {
+  usersCollection
+    .createIndex({ email: 1 }, { unique: true })
+    .catch((e) => console.error("users email index error", e));
+  usersCollection
+    .createIndex({ "addresses.id": 1 })
+    .catch((e) => console.error("addresses id index error", e));
+}
+
+if (orders) {
+  orders
+    .createIndex({ orderId: 1 }, { unique: true })
+    .catch((e) => console.error("orders orderId index error", e));
+  orders
+    .createIndex({ email: 1, time: -1 })
+    .catch((e) => console.error("orders email index error", e));
+}
+
 const ah = (fn) => (req, res, next) =>
   Promise.resolve(fn(req, res, next)).catch(next);
 
@@ -102,6 +122,10 @@ function toClient(doc) {
   if (!doc) return doc;
   const { _id, ...rest } = doc;
   return { id: _id.toString(), ...rest };
+}
+
+function isValidEmail(email) {
+  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
 
 function pctDelta(current, previous) {
@@ -324,6 +348,9 @@ function formatOrder(o) {
     status: o.status,
     payment: o.payment,
     items: o.items,
+    addressId: o.addressId || null,
+    address: o.address || null,
+    phone: o.phone || null,
     total: +Number(o.total || 0).toFixed(2),
     time: formatOrderTime(o.time),
   };
@@ -484,13 +511,74 @@ async function buildCartResponse(userId) {
   return { items, count, subtotal: +subtotal.toFixed(2) };
 }
 
+function snapshotAddress(address, phone) {
+  if (!address || typeof address !== "object") return null;
+  return {
+    label: address.label || "",
+    line1: address.line1 || "",
+    line2: address.line2 || "",
+    city: address.city || "",
+    postalCode: address.postalCode || "",
+    country: address.country || "",
+    phone: phone || address.phone || "",
+  };
+}
+
+async function resolveOrderAddress({
+  addressId,
+  address,
+  phone,
+  email,
+  userId,
+}) {
+  if (!addressId && !address)
+    return { addressId: null, address: null, phone: phone || null };
+
+  if (addressId && userId) {
+    const user = await usersCollection.findOne(
+      { email },
+      { projection: { addresses: 1, phone: 1 } },
+    );
+    const list = Array.isArray(user?.addresses) ? user.addresses : [];
+    const found = list.find((a) => String(a.id) === String(addressId));
+    if (found) {
+      return {
+        addressId: found.id,
+        address: snapshotAddress(found, phone),
+        phone: phone || found.phone || user?.phone || null,
+      };
+    }
+  }
+
+  if (address) {
+    const snapshot = snapshotAddress(address, phone);
+    return {
+      addressId: address.id || null,
+      address: snapshot,
+      phone: snapshot?.phone || phone || null,
+    };
+  }
+
+  return { addressId: null, address: null, phone: phone || null };
+}
+
 async function createOrderHandler(req, res) {
-  const { customer, email, channel, table, items, payment } = req.body || {};
+  const {
+    customer,
+    email,
+    channel,
+    table,
+    items,
+    payment,
+    addressId,
+    address,
+    phone,
+  } = req.body || {};
 
   const authEmail = req.user?.email || null;
   const authUserId = req.user?.id || null;
 
-  const finalEmail = authEmail || email;
+  const finalEmail = (authEmail || email || "").trim().toLowerCase();
   const finalCustomer = customer || req.user?.name;
 
   if (
@@ -501,6 +589,10 @@ async function createOrderHandler(req, res) {
     !items.length
   )
     return res.status(400).json({ error: "Invalid order data" });
+
+  if (channel === "Delivery" && !addressId && !address) {
+    return res.status(400).json({ error: "A delivery address is required" });
+  }
 
   const count = await orders.countDocuments({});
   const orderId = `MT-${4000 + count + 1}`;
@@ -515,6 +607,14 @@ async function createOrderHandler(req, res) {
     )
     .toFixed(2);
 
+  const resolved = await resolveOrderAddress({
+    addressId,
+    address,
+    phone,
+    email: finalEmail,
+    userId: authUserId,
+  });
+
   const doc = {
     orderId,
     customer: finalCustomer,
@@ -525,6 +625,9 @@ async function createOrderHandler(req, res) {
     status: "Pending",
     payment: payment || "Card",
     items,
+    addressId: resolved.addressId,
+    address: resolved.address,
+    phone: resolved.phone,
     total: +(subtotal * 1.05).toFixed(2),
     time: new Date(),
   };
@@ -567,25 +670,38 @@ async function createReservationHandler(req, res) {
 
   if (
     !finalName ||
-    !finalEmail ||
-    !phone ||
-    !date ||
-    !time ||
-    !(Number(guests) >= 1)
-  )
-    return res.status(400).json({ error: "Invalid reservation data" });
+    typeof finalName !== "string" ||
+    finalName.trim().length < 2
+  ) {
+    return res.status(400).json({ error: "A valid name is required" });
+  }
+  if (!isValidEmail(finalEmail)) {
+    return res.status(400).json({ error: "A valid email is required" });
+  }
+  if (!phone || typeof phone !== "string" || phone.trim().length < 5) {
+    return res.status(400).json({ error: "A valid phone number is required" });
+  }
+  if (!date || !time) {
+    return res.status(400).json({ error: "Date and time are required" });
+  }
+  const guestCount = Number(guests);
+  if (!Number.isFinite(guestCount) || guestCount < 1 || guestCount > 50) {
+    return res
+      .status(400)
+      .json({ error: "Guests must be a number between 1 and 50" });
+  }
 
   const doc = {
-    name: finalName,
-    email: finalEmail,
+    name: finalName.trim(),
+    email: finalEmail.trim().toLowerCase(),
     userId: req.user?.id || null,
-    phone,
+    phone: phone.trim(),
     date,
     time,
-    guests: Number(guests),
+    guests: guestCount,
     occasion: occasion || "",
     notes: notes || "",
-    status: "Confirmed",
+    status: "Pending",
     table: null,
     createdAt: new Date(),
   };
@@ -622,7 +738,6 @@ app.use((req, res, next) => {
   }
   next();
 });
-
 if (db) {
   configurePassport(usersCollection);
 }
@@ -633,10 +748,6 @@ const { authenticate, optionalAuthenticate } = buildAuthMiddleware(
 );
 
 const authLimiter = createRateLimiter({ windowMs: 15 * 60 * 1000, max: 30 });
-
-function isValidEmail(email) {
-  return typeof email === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
-}
 
 function getCookieOptions() {
   const isProd = process.env.NODE_ENV === "production";
@@ -669,6 +780,9 @@ function toSafeUser(user) {
     role: user.role || "user",
     provider: user.provider || "email",
     isVerified: user.isVerified === true,
+    phone: user.phone || "",
+    addresses: Array.isArray(user.addresses) ? user.addresses : [],
+    defaultAddressId: user.defaultAddressId || null,
   };
 }
 
@@ -714,6 +828,27 @@ function clientOrigin() {
   );
 }
 
+function normalizeAddressInput(body) {
+  return {
+    label: typeof body.label === "string" ? body.label.trim() : "",
+    line1: typeof body.line1 === "string" ? body.line1.trim() : "",
+    line2: typeof body.line2 === "string" ? body.line2.trim() : "",
+    city: typeof body.city === "string" ? body.city.trim() : "",
+    postalCode:
+      typeof body.postalCode === "string" ? body.postalCode.trim() : "",
+    country: typeof body.country === "string" ? body.country.trim() : "",
+    phone: typeof body.phone === "string" ? body.phone.trim() : "",
+  };
+}
+
+function validateAddress(address) {
+  if (!address.line1) return "Address line 1 is required";
+  if (!address.city) return "City is required";
+  if (!address.phone) return "Phone number is required";
+  if (address.phone.length < 5) return "Phone number is too short";
+  return null;
+}
+
 app.post(
   "/api/auth/register",
   authLimiter,
@@ -755,6 +890,9 @@ app.post(
       email: normalizedEmail,
       password: hashed,
       profileImage: "",
+      phone: "",
+      addresses: [],
+      defaultAddressId: null,
       provider: "email",
       providerId: null,
       role: "user",
@@ -830,7 +968,22 @@ app.get(
   "/api/auth/me",
   authenticate,
   ah(async (req, res) => {
-    res.json({ success: true, user: req.user });
+    const user = await usersCollection.findOne(
+      { email: req.user.email },
+      {
+        projection: {
+          password: 0,
+          resetPasswordToken: 0,
+          resetPasswordExpires: 0,
+        },
+      },
+    );
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+    res.json({ success: true, user: toSafeUser(user) });
   }),
 );
 
@@ -1043,13 +1196,290 @@ app.get(
 );
 
 app.get(
+  "/api/me",
+  authenticate,
+  ah(async (req, res) => {
+    const user = await usersCollection.findOne(
+      { email: req.user.email },
+      {
+        projection: {
+          password: 0,
+          resetPasswordToken: 0,
+          resetPasswordExpires: 0,
+        },
+      },
+    );
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+    res.json({ success: true, user: toSafeUser(user) });
+  }),
+);
+
+app.patch(
+  "/api/me",
+  authenticate,
+  ah(async (req, res) => {
+    const { name, profileImage, phone } = req.body || {};
+    const update = {};
+    if (typeof name === "string" && name.trim().length >= 2)
+      update.name = name.trim();
+    if (typeof profileImage === "string")
+      update.profileImage = profileImage.trim();
+    if (typeof phone === "string") update.phone = phone.trim();
+
+    if (Object.keys(update).length === 0) {
+      return res
+        .status(400)
+        .json({ success: false, message: "No fields provided" });
+    }
+    update.updatedAt = new Date();
+
+    const result = await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: update },
+    );
+    if (result.matchedCount === 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    const fresh = await usersCollection.findOne(
+      { email: req.user.email },
+      {
+        projection: {
+          password: 0,
+          resetPasswordToken: 0,
+          resetPasswordExpires: 0,
+        },
+      },
+    );
+    res.json({ success: true, user: toSafeUser(fresh) });
+  }),
+);
+
+app.get(
+  "/api/me/addresses",
+  authenticate,
+  ah(async (req, res) => {
+    const user = await usersCollection.findOne(
+      { email: req.user.email },
+      { projection: { addresses: 1, phone: 1, defaultAddressId: 1 } },
+    );
+    res.json({
+      addresses: Array.isArray(user?.addresses) ? user.addresses : [],
+      phone: user?.phone || "",
+      defaultAddressId: user?.defaultAddressId || null,
+    });
+  }),
+);
+
+app.post(
+  "/api/me/addresses",
+  authenticate,
+  ah(async (req, res) => {
+    const input = normalizeAddressInput(req.body || {});
+    const err = validateAddress(input);
+    if (err) {
+      return res.status(400).json({ success: false, message: err });
+    }
+
+    const user = await usersCollection.findOne({ email: req.user.email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    const existing = Array.isArray(user.addresses) ? user.addresses : [];
+    if (existing.length >= 7) {
+      return res.status(400).json({
+        success: false,
+        message: "You can save up to 7 addresses",
+      });
+    }
+
+    const address = {
+      id: new ObjectId().toString(),
+      label: input.label || `Address ${existing.length + 1}`,
+      line1: input.line1,
+      line2: input.line2,
+      city: input.city,
+      postalCode: input.postalCode,
+      country: input.country,
+      phone: input.phone,
+      createdAt: new Date(),
+    };
+
+    const shouldBeDefault =
+      req.body?.isDefault === true || existing.length === 0;
+
+    const update = {
+      $push: { addresses: address },
+      $set: { updatedAt: new Date() },
+    };
+    if (!user.phone && address.phone) {
+      update.$set.phone = address.phone;
+    }
+    if (shouldBeDefault) {
+      update.$set.defaultAddressId = address.id;
+      if (!user.phone && address.phone) update.$set.phone = address.phone;
+    }
+
+    await usersCollection.updateOne({ email: req.user.email }, update);
+
+    res.status(201).json({ success: true, address });
+  }),
+);
+
+app.patch(
+  "/api/me/addresses/:id",
+  authenticate,
+  ah(async (req, res) => {
+    const { id } = req.params;
+    const user = await usersCollection.findOne({ email: req.user.email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    const list = Array.isArray(user.addresses) ? user.addresses : [];
+    const idx = list.findIndex((a) => String(a.id) === String(id));
+    if (idx < 0) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Address not found" });
+    }
+
+    const input = normalizeAddressInput({ ...list[idx], ...(req.body || {}) });
+    const err = validateAddress(input);
+    if (err) {
+      return res.status(400).json({ success: false, message: err });
+    }
+
+    list[idx] = {
+      ...list[idx],
+      label: input.label || list[idx].label,
+      line1: input.line1,
+      line2: input.line2,
+      city: input.city,
+      postalCode: input.postalCode,
+      country: input.country,
+      phone: input.phone,
+      updatedAt: new Date(),
+    };
+
+    const setFields = { addresses: list, updatedAt: new Date() };
+    if (req.body?.isDefault === true) {
+      setFields.defaultAddressId = id;
+    }
+
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: setFields },
+    );
+
+    res.json({ success: true, address: list[idx] });
+  }),
+);
+
+app.delete(
+  "/api/me/addresses/:id",
+  authenticate,
+  ah(async (req, res) => {
+    const { id } = req.params;
+    const user = await usersCollection.findOne({ email: req.user.email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    const list = (Array.isArray(user.addresses) ? user.addresses : []).filter(
+      (a) => String(a.id) !== String(id),
+    );
+
+    const setFields = { addresses: list, updatedAt: new Date() };
+    if (String(user.defaultAddressId || "") === String(id)) {
+      setFields.defaultAddressId = list[0]?.id || null;
+    }
+
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: setFields },
+    );
+
+    res.json({ success: true, message: "Address removed" });
+  }),
+);
+
+app.patch(
+  "/api/me/addresses/:id/default",
+  authenticate,
+  ah(async (req, res) => {
+    const { id } = req.params;
+    const user = await usersCollection.findOne({ email: req.user.email });
+    if (!user) {
+      return res
+        .status(404)
+        .json({ success: false, message: "User not found" });
+    }
+
+    const list = Array.isArray(user.addresses) ? user.addresses : [];
+    const found = list.find((a) => String(a.id) === String(id));
+    if (!found) {
+      return res
+        .status(404)
+        .json({ success: false, message: "Address not found" });
+    }
+
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      {
+        $set: {
+          defaultAddressId: id,
+          phone: found.phone || user.phone || "",
+          updatedAt: new Date(),
+        },
+      },
+    );
+
+    res.json({ success: true, defaultAddressId: id });
+  }),
+);
+
+app.patch(
+  "/api/me/phone",
+  authenticate,
+  ah(async (req, res) => {
+    const { phone } = req.body || {};
+    if (typeof phone !== "string" || phone.trim().length < 5) {
+      return res
+        .status(400)
+        .json({ success: false, message: "A valid phone number is required" });
+    }
+
+    await usersCollection.updateOne(
+      { email: req.user.email },
+      { $set: { phone: phone.trim(), updatedAt: new Date() } },
+    );
+
+    res.json({ success: true, phone: phone.trim() });
+  }),
+);
+
+app.get(
   "/api/admin/users",
   authenticate,
   requireAdmin,
   ah(async (req, res) => {
     const list = await usersCollection
       .find()
-      .project({ password: 0 })
+      .project({ password: 0, resetPasswordToken: 0, resetPasswordExpires: 0 })
       .sort({ createdAt: -1 })
       .toArray();
     res.json({ success: true, users: list.map(toClient) });
@@ -1089,6 +1519,9 @@ app.post(
       email: normalizedEmail,
       password: password ? await bcrypt.hash(password, 12) : null,
       profileImage: "",
+      phone: "",
+      addresses: [],
+      defaultAddressId: null,
       provider: "email",
       providerId: null,
       role,
@@ -1498,24 +1931,67 @@ app.delete(
   }),
 );
 
+function tierFor(spent) {
+  if (spent >= 1000) return "VIP";
+  if (spent >= 500) return "Gold";
+  if (spent >= 200) return "Silver";
+  return "Regular";
+}
+
 app.get(
   "/api/customers",
   authenticate,
   requireAdmin,
   ah(async (req, res) => {
     const { tier, search } = req.query;
-    const query = {};
-    if (tier && tier !== "All") query.tier = tier;
+
+    const baseQuery = {};
     if (search) {
       const s = String(search);
-      query.$or = [
+      baseQuery.$or = [
         { name: { $regex: s, $options: "i" } },
         { email: { $regex: s, $options: "i" } },
         { city: { $regex: s, $options: "i" } },
       ];
     }
-    const list = await customers.find(query).sort({ spent: -1 }).toArray();
-    res.json(list.map(toClient));
+
+    const list = await customers.find(baseQuery).toArray();
+
+    const agg = await orders
+      .aggregate([
+        { $match: { status: { $ne: "Cancelled" } } },
+        {
+          $group: {
+            _id: { $toLower: "$email" },
+            orders: { $sum: 1 },
+            spent: { $sum: "$total" },
+            lastTime: { $max: "$time" },
+          },
+        },
+      ])
+      .toArray();
+    const byEmail = new Map(agg.map((a) => [a._id, a]));
+
+    const enriched = list.map((c) => {
+      const a = byEmail.get((c.email || "").toLowerCase());
+      const spent = Number(a?.spent || 0);
+      return {
+        ...toClient(c),
+        orders: a?.orders || 0,
+        spent: +spent.toFixed(2),
+        tier: tierFor(spent),
+        lastVisit: a?.lastTime
+          ? new Date(a.lastTime).toISOString().slice(0, 10)
+          : c.lastVisit || "",
+      };
+    });
+
+    const filtered =
+      tier && tier !== "All"
+        ? enriched.filter((c) => c.tier === tier)
+        : enriched;
+
+    res.json(filtered.sort((a, b) => b.spent - a.spent));
   }),
 );
 
@@ -1529,7 +2005,7 @@ app.post(
       return res.status(400).json({ error: "Name and email required" });
     const doc = {
       name,
-      email,
+      email: email.trim().toLowerCase(),
       city: city || "",
       orders: 0,
       spent: 0,
@@ -1707,6 +2183,9 @@ app.patch(
       "customer",
       "channel",
       "items",
+      "phone",
+      "address",
+      "addressId",
     ]);
     if (Object.keys(update).length === 0) {
       return res.status(400).json({ error: "No fields provided" });
@@ -1904,10 +2383,15 @@ app.get(
   "/reservations/my-reservations",
   authenticate,
   ah(async (req, res) => {
+    const limit = Math.min(
+      Math.max(parseInt(req.query.limit, 10) || 100, 1),
+      200,
+    );
     const query = { $or: [{ userId: req.user.id }, { email: req.user.email }] };
     const list = await reservations
       .find(query)
       .sort({ date: 1, time: 1 })
+      .limit(limit)
       .toArray();
     res.json(list.map(toClient));
   }),
@@ -2093,6 +2577,335 @@ app.get(
   }),
 );
 
+const COLORS = {
+  ink: "#1A1A1A",
+  muted: "#6B6B6B",
+  border: "#D9D9D9",
+  headerBg: "#F2F2F2",
+  gold: "#E0A526",
+  zebra: "#FAFAFA",
+  headerInk: "#2B1B10",
+};
+
+function csvEscape(v) {
+  const s = String(v ?? "");
+  if (s.includes(",") || s.includes('"') || s.includes("\n")) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+function buildCsv(report, rows) {
+  const meta = [
+    [report.name || "Report"],
+    [`Generated ${new Date().toLocaleString("en-US")}`],
+    [`Period: ${report.range || "—"}`],
+    [],
+  ];
+  const all = [...meta, ...rows];
+  return "\uFEFF" + all.map((r) => r.map(csvEscape).join(",")).join("\r\n");
+}
+
+function buildXlsx(report, rows) {
+  const meta = [
+    [report.name || "Report"],
+    ["Generated", new Date().toLocaleString("en-US")],
+    ["Period", report.range || "—"],
+    [],
+  ];
+  const aoa = [...meta, ...rows];
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+
+  const widths = [];
+  rows.forEach((row) => {
+    row.forEach((cell, i) => {
+      const len = String(cell ?? "").length + 2;
+      widths[i] = Math.max(widths[i] || 10, Math.min(len, 50));
+    });
+  });
+  ws["!cols"] = widths.map((w) => ({ wch: w }));
+
+  const headerRow = meta.length;
+  const range = XLSX.utils.decode_range(ws["!ref"]);
+  for (let c = range.s.c; c <= range.e.c; c++) {
+    const cell = ws[XLSX.utils.encode_cell({ r: headerRow, c })];
+    if (cell) {
+      cell.s = {
+        font: { bold: true, color: { rgb: "FFFFFFFF" } },
+        fill: { fgColor: { rgb: "FFE0A526" } },
+        alignment: { vertical: "center", horizontal: "left" },
+      };
+    }
+  }
+
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Report");
+  return XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+}
+
+function buildPdf(report, rows) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      size: "A4",
+      layout: "landscape",
+      margin: 30,
+      info: {
+        Title: report.name || "Report",
+        Author: "Master Table",
+        Subject: report.range || "",
+      },
+    });
+
+    const chunks = [];
+    doc.on("data", (c) => chunks.push(c));
+    doc.on("end", () => resolve(Buffer.concat(chunks)));
+    doc.on("error", reject);
+
+    const pageWidth =
+      doc.page.width - doc.page.margins.left - doc.page.margins.right;
+    const leftX = doc.page.margins.left;
+
+    doc.rect(0, 0, doc.page.width, 90).fill(COLORS.gold);
+    doc
+      .fillColor(COLORS.headerInk)
+      .font("Helvetica-Bold")
+      .fontSize(20)
+      .text("MASTER TABLE", leftX, 26, { width: pageWidth });
+    doc
+      .fillColor(COLORS.headerInk)
+      .font("Helvetica")
+      .fontSize(10)
+      .text("Restaurant Analytics", leftX, 52, { width: pageWidth });
+
+    let cursorY = 120;
+
+    doc
+      .fillColor(COLORS.ink)
+      .font("Helvetica-Bold")
+      .fontSize(18)
+      .text(report.name || "Report", leftX, cursorY, { width: pageWidth });
+    cursorY += 26;
+
+    doc.fillColor(COLORS.muted).font("Helvetica").fontSize(10);
+    doc.text(`Period: ${report.range || "—"}`, leftX, cursorY);
+    cursorY += 14;
+    doc.text(
+      `Generated: ${new Date().toLocaleString("en-US")}`,
+      leftX,
+      cursorY,
+    );
+    cursorY += 14;
+    doc.text(`Format: ${report.format || "PDF"}`, leftX, cursorY);
+    cursorY += 20;
+
+    doc
+      .moveTo(leftX, cursorY)
+      .lineTo(leftX + pageWidth, cursorY)
+      .strokeColor(COLORS.border)
+      .lineWidth(1)
+      .stroke();
+    cursorY += 16;
+
+    if (!rows.length) {
+      doc
+        .fillColor(COLORS.muted)
+        .font("Helvetica-Oblique")
+        .fontSize(11)
+        .text("No data available.", leftX, cursorY);
+      doc.end();
+      return;
+    }
+
+    const headers = rows[0];
+    const body = rows.slice(1);
+    const colCount = headers.length;
+    const colWidth = pageWidth / colCount;
+    const rowHeight = 22;
+    const headerHeight = 28;
+    const bottomLimit = doc.page.height - doc.page.margins.bottom - 20;
+
+    const drawHeader = () => {
+      doc.rect(leftX, cursorY, pageWidth, headerHeight).fill(COLORS.headerBg);
+      doc.fillColor(COLORS.ink).font("Helvetica-Bold").fontSize(9);
+      headers.forEach((h, i) => {
+        doc.text(String(h), leftX + 8 + i * colWidth, cursorY + 9, {
+          width: colWidth - 16,
+          height: headerHeight,
+          ellipsis: true,
+        });
+      });
+      doc
+        .rect(leftX, cursorY, pageWidth, headerHeight)
+        .strokeColor(COLORS.border)
+        .lineWidth(0.5)
+        .stroke();
+      cursorY += headerHeight;
+    };
+
+    drawHeader();
+    doc.font("Helvetica").fontSize(9).fillColor(COLORS.ink);
+
+    body.forEach((row, idx) => {
+      if (cursorY + rowHeight > bottomLimit) {
+        doc.addPage();
+        cursorY = doc.page.margins.top;
+        drawHeader();
+        doc.font("Helvetica").fontSize(9).fillColor(COLORS.ink);
+      }
+      if (idx % 2 === 1) {
+        doc.rect(leftX, cursorY, pageWidth, rowHeight).fill(COLORS.zebra);
+      }
+      row.forEach((cell, i) => {
+        doc.fillColor(COLORS.ink);
+        doc.text(String(cell ?? ""), leftX + 8 + i * colWidth, cursorY + 7, {
+          width: colWidth - 16,
+          height: rowHeight,
+          ellipsis: true,
+          lineBreak: false,
+        });
+      });
+      doc
+        .rect(leftX, cursorY, pageWidth, rowHeight)
+        .strokeColor(COLORS.border)
+        .lineWidth(0.3)
+        .stroke();
+      cursorY += rowHeight;
+    });
+
+    const range = doc.bufferedPageRange();
+    for (let p = 0; p < range.count; p++) {
+      doc.switchToPage(range.start + p);
+      const y = doc.page.height - doc.page.margins.bottom + 5;
+      doc
+        .moveTo(leftX, y - 10)
+        .lineTo(leftX + pageWidth, y - 10)
+        .strokeColor(COLORS.border)
+        .lineWidth(0.5)
+        .stroke();
+      doc
+        .fillColor(COLORS.muted)
+        .font("Helvetica")
+        .fontSize(8)
+        .text(`Master Table · ${report.name || "Report"}`, leftX, y, {
+          width: pageWidth / 2,
+          align: "left",
+        });
+      doc.text(`Page ${p + 1} of ${range.count}`, leftX, y, {
+        width: pageWidth,
+        align: "right",
+      });
+    }
+
+    doc.end();
+  });
+}
+
+async function buildReportRows(report) {
+  const name = (report.name || "").toLowerCase();
+
+  if (name.includes("inventory")) {
+    const list = await products
+      .find()
+      .project({ name: 1, category: 1, stock: 1, sold: 1, price: 1, status: 1 })
+      .sort({ stock: 1 })
+      .toArray();
+    return [
+      ["Product", "Category", "Stock", "Sold", "Price", "Status"],
+      ...list.map((p) => [
+        p.name,
+        p.category,
+        p.stock ?? 0,
+        p.sold ?? 0,
+        `$${Number(p.price ?? 0).toFixed(2)}`,
+        p.status ?? "Active",
+      ]),
+    ];
+  }
+
+  if (name.includes("customer")) {
+    const list = await customers.find().sort({ spent: -1 }).toArray();
+    const agg = await orders
+      .aggregate([
+        { $match: { status: { $ne: "Cancelled" } } },
+        {
+          $group: {
+            _id: { $toLower: "$email" },
+            orders: { $sum: 1 },
+            spent: { $sum: "$total" },
+            lastTime: { $max: "$time" },
+          },
+        },
+      ])
+      .toArray();
+    const byEmail = new Map(agg.map((a) => [a._id, a]));
+
+    return [
+      ["Name", "Email", "City", "Orders", "Spent", "Tier", "Last visit"],
+      ...list.map((c) => {
+        const a = byEmail.get((c.email || "").toLowerCase());
+        const spent = Number(a?.spent || c.spent || 0);
+        return [
+          c.name,
+          c.email,
+          c.city || "—",
+          a?.orders || c.orders || 0,
+          `$${spent.toFixed(2)}`,
+          tierFor(spent),
+          a?.lastTime
+            ? new Date(a.lastTime).toISOString().slice(0, 10)
+            : c.lastVisit || "—",
+        ];
+      }),
+    ];
+  }
+
+  if (name.includes("menu")) {
+    const list = await products.find().sort({ sold: -1 }).toArray();
+    return [
+      ["Product", "Category", "Price", "Sold", "Revenue", "Rating"],
+      ...list.map((p) => [
+        p.name,
+        p.category,
+        `$${Number(p.price ?? 0).toFixed(2)}`,
+        p.sold ?? 0,
+        `$${(Number(p.price ?? 0) * Number(p.sold ?? 0)).toFixed(2)}`,
+        Number(p.rating ?? 0).toFixed(1),
+      ]),
+    ];
+  }
+
+  const list = await orders
+    .find({ status: { $ne: "Cancelled" } })
+    .sort({ time: -1 })
+    .limit(500)
+    .toArray();
+
+  const rows = [
+    ["Order ID", "Customer", "Phone", "Status", "Items", "Total", "Time"],
+  ];
+
+  list.forEach((o) => {
+    rows.push([
+      o.orderId,
+      o.customer,
+      o.phone || o.address?.phone || "—",
+      o.status,
+      (o.items || []).join(", "),
+      `$${Number(o.total ?? 0).toFixed(2)}`,
+      o.time instanceof Date
+        ? o.time.toLocaleString("en-US", {
+            month: "short",
+            day: "numeric",
+            hour: "numeric",
+            minute: "2-digit",
+          })
+        : String(o.time ?? ""),
+    ]);
+  });
+
+  return rows;
+}
+
 app.get(
   "/api/reports",
   authenticate,
@@ -2120,6 +2933,62 @@ app.post(
     };
     const result = await reports.insertOne(doc);
     res.status(201).json(toClient({ _id: result.insertedId, ...doc }));
+  }),
+);
+
+app.get(
+  "/api/reports/:id/download",
+  authenticate,
+  requireAdmin,
+  ah(async (req, res) => {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ error: "Invalid report id" });
+
+    const report = await reports.findOne({ _id });
+    if (!report) return res.status(404).json({ error: "Report not found" });
+
+    const format = (report.format || "CSV").toUpperCase();
+    const safeName = (report.name || "report")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-|-$/g, "");
+    const stamp = new Date().toISOString().slice(0, 10);
+    const rows = await buildReportRows(report);
+
+    if (format === "CSV") {
+      const csv = buildCsv(report, rows);
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeName}-${stamp}.csv"`,
+      );
+      return res.send(csv);
+    }
+
+    if (format === "XLSX") {
+      const buf = buildXlsx(report, rows);
+      res.setHeader(
+        "Content-Type",
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      );
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeName}-${stamp}.xlsx"`,
+      );
+      return res.send(buf);
+    }
+
+    if (format === "PDF") {
+      const buf = await buildPdf(report, rows);
+      res.setHeader("Content-Type", "application/pdf");
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeName}-${stamp}.pdf"`,
+      );
+      return res.send(buf);
+    }
+
+    res.status(400).json({ error: `Unsupported format: ${format}` });
   }),
 );
 
@@ -2306,6 +3175,30 @@ const updateBanner = ah(async (req, res) => {
 
 app.patch("/banners/:id", authenticate, requireAdmin, updateBanner);
 app.put("/banners/:id", authenticate, requireAdmin, updateBanner);
+
+app.delete(
+  "/api/reports/:id",
+  authenticate,
+  requireAdmin,
+  ah(async (req, res) => {
+    const _id = oid(req.params.id);
+    if (!_id) return res.status(400).json({ error: "Invalid report id" });
+    const result = await reports.deleteOne({ _id });
+    if (result.deletedCount === 0)
+      return res.status(404).json({ error: "Report not found" });
+    res.json({ message: "Report deleted" });
+  }),
+);
+
+app.delete(
+  "/api/reports",
+  authenticate,
+  requireAdmin,
+  ah(async (req, res) => {
+    const result = await reports.deleteMany({});
+    res.json({ message: `${result.deletedCount} reports deleted` });
+  }),
+);
 
 app.delete(
   "/banners/:id",
