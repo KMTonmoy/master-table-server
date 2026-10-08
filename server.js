@@ -30,12 +30,13 @@ const stripe = require("stripe")(
 
 const allowedOrigins = [
   "http://localhost:3000",
+  "http://localhost:8000",
   process.env.CLIENT_ORIGIN
     ? process.env.CLIENT_ORIGIN.replace(/\/+$/, "")
     : null,
   "https://mastertable.vercel.app",
+  "https://master-table-server.vercel.app",
 ].filter(Boolean);
-
 app.use(
   cors({
     origin: allowedOrigins,
@@ -371,60 +372,121 @@ function relativeTime(date) {
   });
 }
 
+const toSearchResult = (doc) => {
+  const id = doc._id.toString();
+  return { ...doc, _id: id, id };
+};
+
+const searchWords = (s) =>
+  String(s || "")
+    .toLowerCase()
+    .split(/[^\p{L}\p{N}]+/u)
+    .filter(Boolean);
+
+const allowedTypos = (len) => (len <= 3 ? 0 : len <= 5 ? 1 : 2);
+
+function prepareProduct(p) {
+  const name = String(p.name || "").toLowerCase();
+  const category = String(p.category || "").toLowerCase();
+  const cuisine = String(p.cuisine || "").toLowerCase();
+  const tags = (Array.isArray(p.tags) ? p.tags : []).map((t) =>
+    String(t).toLowerCase(),
+  );
+  const ingredients = (Array.isArray(p.ingredients) ? p.ingredients : []).map(
+    (t) => String(t).toLowerCase(),
+  );
+  const description = String(p.description || "").toLowerCase();
+
+  return {
+    name,
+    nameWords: searchWords(name),
+    category,
+    cuisine,
+    tags,
+    ingredients,
+    description,
+    fuzzyWords: [
+      ...searchWords(name),
+      ...searchWords(category),
+      ...searchWords(cuisine),
+      ...tags.flatMap(searchWords),
+      ...ingredients.flatMap(searchWords),
+    ],
+  };
+}
+
+function scoreToken(token, f) {
+  if (f.nameWords.some((w) => w.startsWith(token))) return { score: 12 };
+  if (f.name.includes(token)) return { score: 9 };
+  if (
+    f.category.includes(token) ||
+    f.cuisine.includes(token) ||
+    f.tags.some((t) => t.includes(token))
+  )
+    return { score: 7 };
+  if (f.ingredients.some((i) => i.includes(token))) return { score: 5 };
+  if (f.description.includes(token)) return { score: 3 };
+
+  // Typo tolerance (only for tokens of 4+ letters)
+  const maxDist = allowedTypos(token.length);
+  if (maxDist > 0) {
+    let best = Infinity;
+    for (const w of f.fuzzyWords) {
+      if (Math.abs(w.length - token.length) > maxDist) continue;
+      const d = levenshtein(token, w);
+      if (d < best) best = d;
+    }
+    if (best <= maxDist) return { score: 4 - best, fuzzy: true };
+  }
+  return { score: 0 };
+}
+
 async function keywordSearch(req, res, mapFn) {
   const q = (req.query.q || "").toString().trim();
-  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+  const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 60);
 
-  if (!q) {
-    return res.json({ query: "", count: 0, results: [] });
-  }
+  if (!q) return res.json({ query: "", count: 0, fuzzy: false, results: [] });
+
+  const tokens = searchWords(q);
+  if (tokens.length === 0)
+    return res.json({ query: q, count: 0, fuzzy: false, results: [] });
 
   const qLower = q.toLowerCase();
   const all = await products.find().toArray();
 
-  const substringMatches = all.filter((p) => {
-    const name = (p.name || "").toLowerCase();
-    const category = (p.category || "").toLowerCase();
-    const description = (p.description || "").toLowerCase();
-    return (
-      name.includes(qLower) ||
-      category.includes(qLower) ||
-      description.includes(qLower)
-    );
-  });
+  const matched = [];
+  for (const doc of all) {
+    const f = prepareProduct(doc);
+    let total = 0;
+    let usedFuzzy = false;
+    let ok = true;
 
-  let matched = substringMatches;
+    for (const token of tokens) {
+      const r = scoreToken(token, f);
+      if (r.score <= 0) {
+        ok = false;
+        break;
+      }
+      total += r.score;
+      if (r.fuzzy) usedFuzzy = true;
+    }
+    if (!ok) continue;
 
-  if (matched.length === 0) {
-    const scored = all
-      .map((p) => {
-        const name = p.name || "";
-        const category = p.category || "";
-        const words = (p.description || "").split(/\s+/).filter(Boolean);
-
-        let distance = levenshtein(q, name);
-        distance = Math.min(distance, levenshtein(q, category));
-        words.forEach((w) => {
-          distance = Math.min(distance, levenshtein(q, w));
-        });
-
-        const nameL = name.toLowerCase();
-        const categoryL = category.toLowerCase();
-        const contains = nameL.includes(qLower) || categoryL.includes(qLower);
-
-        return { doc: p, distance, contains };
-      })
-      .filter((item) => item.contains || item.distance <= 3)
-      .sort((a, b) => {
-        if (a.contains !== b.contains) return a.contains ? -1 : 1;
-        return a.distance - b.distance;
-      });
-
-    matched = scored.map((item) => item.doc);
+    if (f.name.includes(qLower)) total += 5; // whole phrase in the name
+    matched.push({ doc, score: total, fuzzy: usedFuzzy });
   }
 
-  const results = matched.slice(0, limit).map(mapFn);
-  res.json({ query: q, count: results.length, results });
+  matched.sort(
+    (a, b) => b.score - a.score || (b.doc.sold || 0) - (a.doc.sold || 0),
+  );
+
+  const results = matched.slice(0, limit).map((m) => mapFn(m.doc));
+  res.json({
+    query: q,
+    count: results.length,
+    fuzzy: matched.length > 0 && matched.every((m) => m.fuzzy),
+    results,
+  });
 }
 
 function requireEmail(req, res) {
@@ -1782,7 +1844,7 @@ app.get(
 app.get(
   "/api/products/keyword",
   ah(async (req, res) => {
-    await keywordSearch(req, res, toClient);
+    await keywordSearch(req, res, toSearchResult);
   }),
 );
 
@@ -3231,7 +3293,7 @@ app.get(
 app.get(
   "/products/keyword",
   ah(async (req, res) => {
-    await keywordSearch(req, res, (doc) => doc);
+    await keywordSearch(req, res, toSearchResult);
   }),
 );
 
